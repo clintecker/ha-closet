@@ -1,0 +1,777 @@
+use std::{collections::BTreeSet, net::SocketAddr, sync::Arc};
+
+use closet::{
+    api,
+    models::{
+        CatalogItem, Generation, GenerationStatus, ImageConfidence, ImageReference, Item,
+        ListQuery, OwnershipScope, Price, Shop, SyncReport, SyncRequest, TodayRequest,
+        TodayResponse, parse_catalog,
+    },
+    store::{GenerationBasis, Store, StoreError},
+};
+use reqwest::{Client, StatusCode};
+use tempfile::TempDir;
+
+const OWNER: &str = "example-owner-credential-for-tests-only";
+const INTEGRATION: &str = "example-adapter-credential-for-tests-only";
+
+fn piece(id: &str, name: &str, category: &str) -> CatalogItem {
+    CatalogItem {
+        id: id.into(),
+        brand: Some("Example label".into()),
+        name: name.into(),
+        category: category.into(),
+        color: Some("Navy".into()),
+        size: None,
+        quantity: Some(1),
+        material: None,
+        sku: None,
+        purchase_source: Some("example".into()),
+        current_ownership_confirmed: false,
+        images: vec![ImageReference {
+            url: "https://images.example.invalid/reference.jpg".into(),
+            source_url: Some("https://example.invalid/product".into()),
+            kind: "product_reference".into(),
+            confidence: ImageConfidence::Medium,
+            notes: Some("Example reference, not an exact variant".into()),
+        }],
+        condition_at_purchase: Some("Example condition".into()),
+        notes: vec!["An invented catalog record".into()],
+        price: Some(Price {
+            amount: 25.5,
+            basis: "item".into(),
+            currency: "USD".into(),
+            quantity_basis: "one".into(),
+        }),
+        shop: Some(Shop {
+            id: "example-shop".into(),
+            label: "Example shop".into(),
+            season: None,
+            years: vec![2026],
+        }),
+    }
+}
+fn catalog() -> Vec<CatalogItem> {
+    vec![
+        piece("example-dress", "Jersey dress", "clothing.dress"),
+        piece("example-shoes", "Leather flats", "footwear.shoes"),
+        piece("example-jumpsuit", "Cotton jumpsuit", "clothing.jumpsuit"),
+    ]
+}
+fn sync(items: Vec<CatalogItem>, dry_run: bool) -> SyncRequest {
+    SyncRequest {
+        items,
+        dry_run,
+        allow_empty: false,
+    }
+}
+
+struct App {
+    _directory: TempDir,
+    store: Store,
+    context: Arc<api::Context>,
+    server: dropshot::HttpServer<Arc<api::Context>>,
+    client: Client,
+    origin: String,
+}
+impl App {
+    async fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("catalog.sqlite3"))
+            .await
+            .unwrap();
+        let context =
+            Arc::new(api::Context::new(store.clone(), OWNER).with_integration(INTEGRATION));
+        let server = api::start(
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            context.clone(),
+        )
+        .unwrap();
+        let origin = format!("http://{}", server.local_addr());
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        Self {
+            _directory: directory,
+            store,
+            context,
+            server,
+            client,
+            origin,
+        }
+    }
+    async fn close(self) {
+        self.server.close().await.unwrap();
+        self.context.shutdown().await.unwrap();
+        self.store.close().await;
+    }
+}
+
+#[test]
+fn the_actual_catalog_parser_preserves_details_and_rejects_unsafe_shapes() {
+    let input = catalog();
+    let bytes = serde_json::to_vec(&input).unwrap();
+    let parsed = parse_catalog(&bytes).unwrap();
+    for item in &input {
+        assert_eq!(
+            parsed.items().iter().find(|other| other.id == item.id),
+            Some(item)
+        );
+    }
+    assert_eq!(parsed.report().count, 3);
+    let mut reversed = input.clone();
+    reversed.reverse();
+    assert_eq!(
+        parse_catalog(&serde_json::to_vec(&reversed).unwrap())
+            .unwrap()
+            .report()
+            .source_hash,
+        parsed.report().source_hash
+    );
+    let mut duplicate = input.clone();
+    duplicate.push(input[0].clone());
+    assert_eq!(
+        parse_catalog(&serde_json::to_vec(&duplicate).unwrap())
+            .unwrap_err()
+            .errors[0]
+            .code,
+        "duplicate_id"
+    );
+    let mut missing = input.clone();
+    missing[0].id = "..".into();
+    assert_eq!(
+        parse_catalog(&serde_json::to_vec(&missing).unwrap())
+            .unwrap_err()
+            .errors[0]
+            .code,
+        "invalid_id"
+    );
+    let mut invalid = input.clone();
+    invalid[0].quantity = Some(0);
+    assert_eq!(
+        parse_catalog(&serde_json::to_vec(&invalid).unwrap())
+            .unwrap_err()
+            .errors[0]
+            .code,
+        "quantity_must_be_positive"
+    );
+    let unknown =
+        String::from_utf8(bytes)
+            .unwrap()
+            .replacen("\"id\":", "\"unknown_field\":true,\"id\":", 1);
+    let error = parse_catalog(unknown.as_bytes()).unwrap_err();
+    assert_eq!(error.code, "invalid_catalog_json");
+    assert!(!error.to_string().contains("unknown_field"));
+}
+
+#[tokio::test]
+async fn sync_is_atomic_revision_checked_and_replays_across_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("catalog.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let input = catalog();
+    let preview = store
+        .sync(sync(input.clone(), true), None, "owner", None)
+        .await
+        .unwrap();
+    assert_eq!((preview.created, preview.catalog_revision), (3, 0));
+    assert_eq!(store.counts().await.unwrap(), (0, 0, 0, 0));
+    let first = store
+        .sync(
+            sync(input.clone(), false),
+            Some(0),
+            "owner",
+            Some("initial"),
+        )
+        .await
+        .unwrap();
+    assert_eq!((first.created, first.catalog_revision), (3, 1));
+    let replay = store
+        .sync(
+            sync(input.clone(), false),
+            Some(0),
+            "owner",
+            Some("initial"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, first);
+    let mut changed = input.clone();
+    changed[0].name = "Different dress".into();
+    assert!(matches!(
+        store
+            .sync(sync(changed, false), Some(1), "owner", Some("initial"))
+            .await,
+        Err(StoreError::Conflict("idempotency_conflict"))
+    ));
+    let mut invalid = input.clone();
+    invalid[1].quantity = Some(0);
+    invalid[0].name = "Must not be saved".into();
+    assert!(
+        store
+            .sync(sync(invalid, false), Some(1), "owner", Some("invalid"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.item("example-dress").await.unwrap().catalog.name,
+        "Jersey dress"
+    );
+    assert!(
+        store
+            .sync(sync(Vec::new(), false), Some(1), "owner", Some("empty"))
+            .await
+            .is_err()
+    );
+    let reduced = vec![input[0].clone(), input[1].clone()];
+    let removed = store
+        .sync(sync(reduced, false), Some(1), "owner", Some("remove"))
+        .await
+        .unwrap();
+    assert_eq!((removed.archived, removed.catalog_revision), (1, 2));
+    assert!(store.item("example-jumpsuit").await.unwrap().archived);
+    let restored = store
+        .sync(
+            sync(input.clone(), false),
+            Some(2),
+            "owner",
+            Some("restore"),
+        )
+        .await
+        .unwrap();
+    assert_eq!((restored.updated, restored.catalog_revision), (1, 3));
+    let restored_item = store.item("example-jumpsuit").await.unwrap();
+    assert!(!restored_item.archived);
+    assert_eq!(restored_item.revision, 3);
+    store.close().await;
+    let reopened = Store::open(&path).await.unwrap();
+    assert_eq!(
+        reopened
+            .sync(sync(input, false), Some(2), "owner", Some("restore"))
+            .await
+            .unwrap(),
+        restored
+    );
+    assert_eq!(
+        reopened
+            .item("example-dress")
+            .await
+            .unwrap()
+            .catalog
+            .price
+            .as_ref()
+            .unwrap()
+            .amount,
+        25.5
+    );
+    reopened.close().await;
+}
+
+#[tokio::test]
+async fn actual_http_enforces_auth_preconditions_adapter_scope_and_etags() {
+    let app = App::new().await;
+    let url = format!("{}/v1/inventory/sync", app.origin);
+    let input = sync(catalog(), false);
+    assert_eq!(
+        app.client
+            .post(&url)
+            .json(&input)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.client
+            .post(&url)
+            .bearer_auth(INTEGRATION)
+            .header("x-closet-admin", "true")
+            .json(&input)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.client
+            .post(&url)
+            .bearer_auth(OWNER)
+            .header("idempotency-key", "missing-etag")
+            .json(&input)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::PRECONDITION_REQUIRED
+    );
+    let response = app
+        .client
+        .post(&url)
+        .bearer_auth(INTEGRATION)
+        .header("x-closet-actor-id", "ha:example-user")
+        .header("x-closet-admin", "true")
+        .header("if-match", "\"0\"")
+        .header("idempotency-key", "adapter-sync")
+        .json(&input)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["etag"], "\"1\"");
+    assert_eq!(response.json::<SyncReport>().await.unwrap().created, 3);
+    let response = app
+        .client
+        .get(format!("{}/v1/items/example-dress", app.origin))
+        .bearer_auth(INTEGRATION)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["etag"], "\"1\"");
+    assert_eq!(
+        response
+            .json::<Item>()
+            .await
+            .unwrap()
+            .catalog
+            .condition_at_purchase
+            .as_deref(),
+        Some("Example condition")
+    );
+    let response = app
+        .client
+        .post(&url)
+        .bearer_auth(OWNER)
+        .header("if-match", "\"0\"")
+        .header("idempotency-key", "stale")
+        .json(&input)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    app.close().await;
+}
+
+#[tokio::test]
+async fn pagination_filters_and_concurrent_writes_have_real_boundaries() {
+    let app = App::new().await;
+    let mut input = catalog();
+    input[0].sku = Some("ÉTÉ-EXAMPLE".into());
+    input.push(piece("example-top", "Top with 100% cotton", "clothing.top"));
+    input.push(piece(
+        "example-topper",
+        "Not a descendant",
+        "clothing.topper",
+    ));
+    app.store
+        .sync(sync(input.clone(), false), Some(0), "owner", Some("start"))
+        .await
+        .unwrap();
+    let first = app
+        .store
+        .list(ListQuery {
+            limit: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!((first.total, first.scope_total), (5, 5));
+    assert!(first.next_page.is_some());
+    let mut seen = BTreeSet::new();
+    seen.insert(first.items[0].catalog.id.clone());
+    let mut next = first.next_page;
+    while let Some(page_token) = next {
+        let page = app
+            .store
+            .list(ListQuery {
+                limit: Some(1),
+                page_token: Some(page_token),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(seen.insert(page.items[0].catalog.id.clone()));
+        next = page.next_page;
+    }
+    assert_eq!(seen.len(), 5);
+    let tops = app
+        .store
+        .list(ListQuery {
+            category: Some("clothing.top".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(tops.total, 1);
+    let percent = app
+        .store
+        .list(ListQuery {
+            q: Some("%".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(percent.total, 1);
+    let unicode_sku = app
+        .store
+        .list(ListQuery {
+            q: Some("été-example".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(unicode_sku.total, 1);
+    let old = app
+        .store
+        .list(ListQuery {
+            limit: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .next_page
+        .unwrap();
+    let mut left = input.clone();
+    left[0].name = "First competing edit".into();
+    let mut right = input.clone();
+    right[0].name = "Second competing edit".into();
+    let url = format!("{}/v1/inventory/sync", app.origin);
+    let left = app
+        .client
+        .post(&url)
+        .bearer_auth(OWNER)
+        .header("if-match", "\"1\"")
+        .header("idempotency-key", "left")
+        .json(&sync(left, false))
+        .send();
+    let right = app
+        .client
+        .post(&url)
+        .bearer_auth(OWNER)
+        .header("if-match", "\"1\"")
+        .header("idempotency-key", "right")
+        .json(&sync(right, false))
+        .send();
+    let (left, right) = tokio::join!(left, right);
+    let statuses = BTreeSet::from([
+        left.unwrap().status().as_u16(),
+        right.unwrap().status().as_u16(),
+    ]);
+    assert_eq!(statuses, BTreeSet::from([200, 412]));
+    assert!(matches!(
+        app.store
+            .list(ListQuery {
+                page_token: Some(old),
+                ..Default::default()
+            })
+            .await,
+        Err(StoreError::Conflict("page_invalidated"))
+    ));
+    app.close().await;
+}
+
+#[tokio::test]
+async fn durable_generation_reservation_survives_restart_and_does_not_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("catalog.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let basis = GenerationBasis {
+        date: "2026-01-02".into(),
+        timezone: "UTC".into(),
+        config_hash: "test-config".into(),
+        items: catalog(),
+    };
+    let first = store
+        .reserve_generation(TodayRequest::default(), basis.clone(), "owner", "attempt")
+        .await
+        .unwrap();
+    assert!(first.fresh);
+    let replay = store
+        .reserve_generation(TodayRequest::default(), basis.clone(), "owner", "attempt")
+        .await
+        .unwrap();
+    assert!(!replay.fresh);
+    assert_eq!(replay.generation.id, first.generation.id);
+    assert!(matches!(
+        store
+            .reserve_generation(TodayRequest::default(), basis.clone(), "owner", "different")
+            .await,
+        Err(StoreError::Conflict("generation_in_progress"))
+    ));
+    store.close().await;
+    let store = Store::open(&path).await.unwrap();
+    let replay = store
+        .reserve_generation(TodayRequest::default(), basis, "owner", "attempt")
+        .await
+        .unwrap();
+    assert!(!replay.fresh);
+    assert_eq!(replay.generation.status, GenerationStatus::Interrupted);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn today_get_never_generates_and_unconfigured_attempt_is_honest() {
+    let app = App::new().await;
+    let get = app
+        .client
+        .get(format!("{}/v1/today", app.origin))
+        .bearer_auth(OWNER)
+        .send()
+        .await
+        .unwrap()
+        .json::<TodayResponse>()
+        .await
+        .unwrap();
+    assert!(get.result.is_none() && get.generation.is_none());
+    let response = app
+        .client
+        .post(format!("{}/v1/today/generate", app.origin))
+        .bearer_auth(INTEGRATION)
+        .header("idempotency-key", "not-admin")
+        .json(&TodayRequest::default())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = app
+        .client
+        .post(format!("{}/v1/today/generate", app.origin))
+        .bearer_auth(OWNER)
+        .header("idempotency-key", "unconfigured")
+        .json(&TodayRequest::default())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let generation = response.json::<Generation>().await.unwrap();
+    let done = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let result = app
+                .client
+                .get(format!("{}/v1/today", app.origin))
+                .bearer_auth(OWNER)
+                .send()
+                .await
+                .unwrap()
+                .json::<TodayResponse>()
+                .await
+                .unwrap();
+            if result
+                .generation
+                .as_ref()
+                .is_some_and(|run| run.status != GenerationStatus::Running)
+            {
+                break result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(done.generation.as_ref().unwrap().id, generation.id);
+    assert_eq!(
+        done.generation.as_ref().unwrap().error_code.as_deref(),
+        Some("today_unconfigured")
+    );
+    assert!(done.result.is_none());
+    let changed = TodayRequest {
+        ownership_scope: OwnershipScope::ConfirmedOnly,
+        ..Default::default()
+    };
+    let response = app
+        .client
+        .post(format!("{}/v1/today/generate", app.origin))
+        .bearer_auth(OWNER)
+        .header("idempotency-key", "unconfigured")
+        .json(&changed)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    app.close().await;
+}
+
+#[tokio::test]
+async fn ingress_peer_and_request_marker_are_not_native_authentication() {
+    let app = App::new().await;
+    let response = app
+        .client
+        .get(format!("{}/v1/items", app.origin))
+        .header("x-remote-user-id", "example")
+        .header("x-closet-request", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let ingress = api::start(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(
+            app.context
+                .as_ref()
+                .clone()
+                .for_ingress("127.0.0.1".parse().unwrap()),
+        ),
+    )
+    .unwrap();
+    let url = format!("http://{}/v1/inventory/sync", ingress.local_addr());
+    let response = app
+        .client
+        .post(&url)
+        .header("x-remote-user-id", "example")
+        .json(&sync(catalog(), true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = app
+        .client
+        .post(&url)
+        .header("x-remote-user-id", "example")
+        .header("x-closet-request", "1")
+        .json(&sync(catalog(), true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    ingress.close().await.unwrap();
+    app.close().await;
+}
+
+#[tokio::test]
+async fn today_keeps_the_last_result_and_rechecks_only_referenced_facts() {
+    use chrono::{Duration, Utc};
+    use closet::models::{Freshness, Suggestion, TodayResult, WeatherMode};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path().join("catalog.sqlite3"))
+        .await
+        .unwrap();
+    let pieces = vec![catalog()[0].clone(), catalog()[1].clone()];
+    store
+        .sync(
+            sync(pieces.clone(), false),
+            Some(0),
+            "owner",
+            Some("catalog"),
+        )
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let date = now.date_naive().to_string();
+    let inputs = TodayRequest {
+        weather_mode: WeatherMode::Ignored,
+        ..Default::default()
+    };
+    let basis = GenerationBasis {
+        date: date.clone(),
+        timezone: "UTC".into(),
+        config_hash: "example-config".into(),
+        items: pieces.clone(),
+    };
+    let first = store
+        .reserve_generation(inputs.clone(), basis.clone(), "owner", "first")
+        .await
+        .unwrap();
+    let result = TodayResult {
+        generation_id: first.generation.id.clone(),
+        inputs: inputs.clone(),
+        generated_at: now,
+        expires_at: now + Duration::hours(1),
+        freshness: Freshness::Ready,
+        stale_reasons: Vec::new(),
+        weather: None,
+        suggestions: vec![Suggestion {
+            label: "An example outfit".into(),
+            item_ids: vec!["example-dress".into(), "example-shoes".into()],
+            advisory_reason: "An optional combination to consider.".into(),
+            warnings: Vec::new(),
+        }],
+    };
+    store
+        .finish_generation(&first.generation.id, Ok(result.clone()))
+        .await
+        .unwrap();
+    let failed = store
+        .reserve_generation(inputs.clone(), basis.clone(), "owner", "failed-refresh")
+        .await
+        .unwrap();
+    store
+        .finish_generation(&failed.generation.id, Err("model_unavailable"))
+        .await
+        .unwrap();
+    let current = store
+        .today(&date, "UTC", "example-config", now)
+        .await
+        .unwrap();
+    assert_eq!(current.result.unwrap().generation_id, first.generation.id);
+    assert_eq!(current.generation.unwrap().status, GenerationStatus::Failed);
+    let mut expanded = pieces.clone();
+    expanded.push(catalog()[2].clone());
+    store
+        .sync(
+            sync(expanded.clone(), false),
+            Some(1),
+            "owner",
+            Some("unrelated-addition"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .today(&date, "UTC", "example-config", now)
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+            .freshness,
+        Freshness::Ready
+    ));
+    let pending = store
+        .reserve_generation(inputs, basis, "owner", "changed-while-running")
+        .await
+        .unwrap();
+    expanded[0].color = Some("Grey".into());
+    store
+        .sync(
+            sync(expanded, false),
+            Some(2),
+            "owner",
+            Some("referenced-change"),
+        )
+        .await
+        .unwrap();
+    let mut result = result;
+    result.generation_id = pending.generation.id.clone();
+    store
+        .finish_generation(&pending.generation.id, Ok(result))
+        .await
+        .unwrap();
+    let current = store
+        .today(&date, "UTC", "example-config", now)
+        .await
+        .unwrap();
+    assert_eq!(
+        current.generation.unwrap().error_code.as_deref(),
+        Some("referenced_items_changed")
+    );
+    let previous = current.result.unwrap();
+    assert_eq!(previous.generation_id, first.generation.id);
+    assert!(matches!(previous.freshness, Freshness::Stale));
+    assert!(
+        previous
+            .stale_reasons
+            .contains(&"referenced_items_changed".into())
+    );
+    assert!(
+        store
+            .today("2099-01-01", "UTC", "example-config", now)
+            .await
+            .unwrap()
+            .result
+            .is_none()
+    );
+    store.close().await;
+}

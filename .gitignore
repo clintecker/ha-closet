@@ -1,0 +1,14 @@
+/target/
+/.venv/
+/work/
+/result
+/result-*
+*.sqlite3
+*.sqlite3-*
+*.db
+.env*
+credentials.json
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.ty_cache/

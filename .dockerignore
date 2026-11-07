@@ -1,0 +1,10 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!migrations/
+!migrations/**
+!web/
+!web/**
+!docker-entrypoint.sh

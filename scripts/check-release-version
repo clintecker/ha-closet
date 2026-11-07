@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""Validate the release's native package metadata, not source snippets."""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+import tomllib
+from pathlib import Path
+
+
+def main() -> int:
+    root = Path(__file__).resolve().parents[1]
+    version = tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"]
+    manifest = json.loads((root / "custom_components/closet/manifest.json").read_text())
+    # HA app metadata uses a scalar YAML version; no YAML parser is needed.
+    app = (root / "closet/config.yaml").read_text()
+    found = re.search(r'^version:\s*["\x27]?([^"\x27\s]+)', app, re.MULTILINE)
+    versions = [manifest["version"], found.group(1) if found else None]
+    if (root / "openapi/api.json").exists():
+        versions.append(json.loads((root / "openapi/api.json").read_text())["info"]["version"])
+    if len(sys.argv) > 1:
+        versions.append(sys.argv[1].removeprefix("v"))
+    if any(value != version for value in versions):
+        print("Release versions disagree", file=sys.stderr)
+        return 1
+    print(f"Release metadata agrees: {version}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,71 @@
+[
+  {
+    "id": "example-tee",
+    "brand": "Studio Example",
+    "name": "Cotton jersey tee",
+    "category": "clothing.top",
+    "color": "Ivory",
+    "size": "S",
+    "quantity": 1,
+    "material": "Cotton jersey",
+    "sku": null,
+    "purchase_source": "example",
+    "current_ownership_confirmed": true,
+    "images": [],
+    "notes": [
+      "Fictional demonstration item."
+    ],
+    "condition_at_purchase": "New"
+  },
+  {
+    "id": "example-denim",
+    "brand": "Studio Example",
+    "name": "Straight-leg denim",
+    "category": "clothing.jeans",
+    "color": "Indigo",
+    "size": "27",
+    "quantity": 1,
+    "material": "Cotton denim",
+    "sku": null,
+    "purchase_source": "example",
+    "current_ownership_confirmed": true,
+    "images": [],
+    "notes": [
+      "Fictional demonstration item."
+    ]
+  },
+  {
+    "id": "example-flats",
+    "brand": "Studio Example",
+    "name": "Leather slingbacks",
+    "category": "footwear.slingbacks",
+    "color": "Black",
+    "size": "38",
+    "quantity": 1,
+    "material": "Leather",
+    "sku": null,
+    "purchase_source": "example",
+    "current_ownership_confirmed": true,
+    "images": [],
+    "notes": [
+      "Fictional demonstration item."
+    ]
+  },
+  {
+    "id": "example-knit",
+    "brand": "Studio Example",
+    "name": "Fine-knit crewneck",
+    "category": "clothing.knitwear",
+    "color": "Navy",
+    "size": "S",
+    "quantity": 1,
+    "material": "Cashmere",
+    "sku": null,
+    "purchase_source": "example",
+    "current_ownership_confirmed": false,
+    "images": [],
+    "notes": [
+      "Fictional demonstration item."
+    ]
+  }
+]

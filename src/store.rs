@@ -1,0 +1,1005 @@
+//! SQLite owns the projection and durable operations, never a second catalog.
+
+use std::{collections::BTreeMap, path::Path};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{
+    QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
+};
+
+use crate::models::{
+    CatalogItem, Facets, Freshness, Generation, GenerationStatus, Item, ItemFilters, ItemsPage,
+    ListQuery, OwnershipScope, SyncReport, SyncRequest, TodayRequest, TodayResponse, TodayResult,
+    ValidationError, digest, validate_catalog,
+};
+
+const COUNTS_SQL: &str = "SELECT (SELECT COUNT(*) FROM items WHERE archived=0) AS active, (SELECT COUNT(*) FROM items WHERE archived=0 AND confirmed=1) AS confirmed, (SELECT COUNT(*) FROM items WHERE archived=1) AS archived";
+const ITEM_SQL: &str = "SELECT body, revision, archived FROM items WHERE id = ?";
+const ACTIVE_ITEMS_SQL: &str = "SELECT body FROM items WHERE archived = 0 ORDER BY id";
+const SCOPE_COUNT_SQL: &str = "SELECT COUNT(*) FROM items WHERE archived = 0";
+const BRANDS_SQL: &str =
+    "SELECT DISTINCT brand FROM items WHERE archived = 0 AND brand IS NOT NULL ORDER BY brand";
+const CATEGORIES_SQL: &str =
+    "SELECT DISTINCT category FROM items WHERE archived = 0 ORDER BY category";
+const RUNNING_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM generations WHERE status='running')";
+const CURRENT_GENERATION_SQL: &str = "SELECT body FROM generations WHERE local_date=? AND timezone=? ORDER BY started_at DESC, id DESC LIMIT 1";
+const GENERATION_BASIS_SQL: &str = "SELECT basis FROM generations WHERE id=?";
+const TODAY_RESULT_SQL: &str =
+    "SELECT body,signatures,config_hash,timezone FROM today_results WHERE local_date=?";
+const RUNNING_GENERATIONS_SQL: &str = "SELECT body FROM generations WHERE status='running'";
+const STATE_SQL: &str = "SELECT revision, source_hash FROM catalog_state WHERE singleton=1";
+const OPERATION_SQL: &str = "SELECT request_hash, response, resource_id FROM operations WHERE scope=? AND actor=? AND key=?";
+const GENERATION_SQL: &str = "SELECT body FROM generations WHERE id=?";
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("invalid_catalog")]
+    InvalidCatalog(#[from] ValidationError),
+    #[error("{0}")]
+    Invalid(&'static str),
+    #[error("not_found")]
+    NotFound,
+    #[error("{0}")]
+    Conflict(&'static str),
+    #[error("revision_conflict")]
+    Revision,
+    #[error("precondition_required")]
+    Precondition,
+    #[error("storage_unavailable")]
+    Database(#[from] sqlx::Error),
+    #[error("stored_data_invalid")]
+    Serialization(#[from] serde_json::Error),
+    #[error("migration_failed")]
+    Migration(#[from] sqlx::migrate::MigrateError),
+}
+impl StoreError {
+    pub fn code(&self) -> &str {
+        match self {
+            Self::InvalidCatalog(error) => &error.code,
+            Self::Invalid(code) | Self::Conflict(code) => code,
+            Self::NotFound => "not_found",
+            Self::Revision => "revision_conflict",
+            Self::Precondition => "precondition_required",
+            Self::Database(_) | Self::Migration(_) => "storage_unavailable",
+            Self::Serialization(_) => "stored_data_invalid",
+        }
+    }
+}
+pub type Result<T> = std::result::Result<T, StoreError>;
+
+#[derive(Clone)]
+pub struct Store {
+    pool: SqlitePool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenerationBasis {
+    pub date: String,
+    pub timezone: String,
+    pub config_hash: String,
+    pub items: Vec<CatalogItem>,
+}
+pub struct Reservation {
+    pub generation: Generation,
+    pub fresh: bool,
+}
+#[derive(Serialize, Deserialize)]
+struct Cursor {
+    revision: i64,
+    filters: ItemFilters,
+    brand: String,
+    name: String,
+    id: String,
+}
+#[derive(Serialize)]
+struct StylingFacts<'a> {
+    id: &'a str,
+    name: &'a str,
+    brand: &'a Option<String>,
+    category: &'a str,
+    color: &'a Option<String>,
+    material: &'a Option<String>,
+    quantity_known: bool,
+    ownership_confirmed: bool,
+    qualified_image: bool,
+}
+
+pub fn styling_hash(item: &CatalogItem) -> Result<String> {
+    Ok(hash(&serde_json::to_vec(&StylingFacts {
+        id: &item.id,
+        name: &item.name,
+        brand: &item.brand,
+        category: &item.category,
+        color: &item.color,
+        material: &item.material,
+        quantity_known: item.quantity.is_some(),
+        ownership_confirmed: item.current_ownership_confirmed,
+        qualified_image: item.images.iter().any(|image| {
+            image.confidence != crate::models::ImageConfidence::High || image.notes.is_some()
+        }),
+    })?))
+}
+fn hash(bytes: &[u8]) -> String {
+    digest(bytes)
+}
+
+impl Store {
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        // One connection serializes the tiny local catalog's transactions. No
+        // transaction holds this connection while calling Home Assistant.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        let store = Self { pool };
+        store.interrupt_running().await?;
+        Ok(store)
+    }
+
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
+    pub async fn ready(&self) -> Result<()> {
+        sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn counts(&self) -> Result<(i64, i64, i64, i64)> {
+        let mut tx = self.pool.begin().await?;
+        let revision = state(&mut tx).await?.0;
+        let row = sqlx::query(COUNTS_SQL).fetch_one(&mut *tx).await?;
+        let counts = (
+            revision,
+            row.try_get("active")?,
+            row.try_get("confirmed")?,
+            row.try_get("archived")?,
+        );
+        tx.commit().await?;
+        Ok(counts)
+    }
+
+    pub async fn item(&self, id: &str) -> Result<Item> {
+        let row = sqlx::query(ITEM_SQL)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        decode_item(&row)
+    }
+
+    pub async fn active_items(&self) -> Result<Vec<CatalogItem>> {
+        let rows = sqlx::query(ACTIVE_ITEMS_SQL).fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|row| Ok(serde_json::from_str(row.try_get("body")?)?))
+            .collect()
+    }
+
+    pub async fn list(&self, query: ListQuery) -> Result<ItemsPage> {
+        let limit = query.limit.unwrap_or(50);
+        if !(1..=100).contains(&limit) {
+            return Err(StoreError::Invalid("invalid_limit"));
+        }
+        let mut filters = query.filters();
+        validate_filters(&filters)?;
+        let cursor = query.page_token.as_deref().map(decode_cursor).transpose()?;
+        if let Some(cursor) = &cursor {
+            if filters != ItemFilters::default() && filters != cursor.filters {
+                return Err(StoreError::Invalid("invalid_page_token"));
+            }
+            filters = cursor.filters.clone();
+        }
+        let mut tx = self.pool.begin().await?;
+        let revision = state(&mut tx).await?.0;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.revision != revision)
+        {
+            return Err(StoreError::Conflict("page_invalidated"));
+        }
+        let scope_total = sqlx::query_scalar(SCOPE_COUNT_SQL)
+            .fetch_one(&mut *tx)
+            .await?;
+        let mut count = count_selection(&filters);
+        let total = count
+            .build_query_scalar::<i64>()
+            .fetch_one(&mut *tx)
+            .await?;
+        let mut select = selection(&filters, cursor.as_ref(), limit);
+        let mut rows = select.build().fetch_all(&mut *tx).await?;
+        let has_more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        let next_page = if has_more {
+            rows.last()
+                .map(|row| -> Result<String> {
+                    encode_cursor(&Cursor {
+                        revision,
+                        filters: filters.clone(),
+                        brand: row.try_get("sort_brand")?,
+                        name: row.try_get("sort_name")?,
+                        id: row.try_get("id")?,
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let items = rows.iter().map(decode_item).collect::<Result<Vec<_>>>()?;
+        let brands = sqlx::query_scalar(BRANDS_SQL).fetch_all(&mut *tx).await?;
+        let categories = sqlx::query_scalar(CATEGORIES_SQL)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(ItemsPage {
+            items,
+            next_page,
+            total,
+            scope_total,
+            facets: Facets { brands, categories },
+            catalog_revision: revision,
+        })
+    }
+
+    pub async fn sync(
+        &self,
+        request: SyncRequest,
+        expected: Option<i64>,
+        actor: &str,
+        key: Option<&str>,
+    ) -> Result<SyncReport> {
+        let catalog = validate_catalog(request.items)?;
+        if catalog.items().is_empty() && !request.allow_empty && !request.dry_run {
+            return Err(StoreError::Invalid("empty_catalog_requires_allow_empty"));
+        }
+        let input_hash = hash(&serde_json::to_vec(&(
+            catalog.items(),
+            request.allow_empty,
+        ))?);
+        let mut tx = self.pool.begin().await?;
+        if !request.dry_run {
+            let key = key.ok_or(StoreError::Invalid("idempotency_key_required"))?;
+            if let Some(row) = operation(&mut tx, "sync", actor, key).await? {
+                if row.try_get::<String, _>("request_hash")? != input_hash {
+                    return Err(StoreError::Conflict("idempotency_conflict"));
+                }
+                let report = serde_json::from_str(row.try_get("response")?)?;
+                tx.commit().await?;
+                return Ok(report);
+            }
+        }
+        let (revision, previous_hash) = state(&mut tx).await?;
+        if !request.dry_run && expected.ok_or(StoreError::Precondition)? != revision {
+            return Err(StoreError::Revision);
+        }
+        let mut reconcile = reconciliation(catalog.items());
+        let rows = reconcile.build().fetch_all(&mut *tx).await?;
+        let existing: BTreeMap<String, (String, bool)> = rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("id")?,
+                    (row.try_get("body")?, row.try_get("archived")?),
+                ))
+            })
+            .collect::<std::result::Result<_, sqlx::Error>>()?;
+        let mut report = SyncReport {
+            catalog_revision: revision,
+            source_hash: catalog.report().source_hash.clone(),
+            created: 0,
+            updated: 0,
+            archived: 0,
+            unchanged: 0,
+        };
+        let source: BTreeMap<&str, &CatalogItem> = catalog
+            .items()
+            .iter()
+            .map(|item| (item.id.as_str(), item))
+            .collect();
+        for item in catalog.items() {
+            let body = serde_json::to_string(item)?;
+            match existing.get(&item.id) {
+                None => report.created += 1,
+                Some((old, archived)) if old != &body || *archived => report.updated += 1,
+                Some(_) => report.unchanged += 1,
+            }
+        }
+        report.archived = existing
+            .iter()
+            .filter(|(id, (_, archived))| !archived && !source.contains_key(id.as_str()))
+            .count();
+        if request.dry_run {
+            tx.commit().await?;
+            return Ok(report);
+        }
+        let changed = report.created + report.updated + report.archived > 0
+            || previous_hash != report.source_hash;
+        if changed {
+            for item in catalog.items() {
+                let body = serde_json::to_string(item)?;
+                if existing
+                    .get(&item.id)
+                    .is_some_and(|(old, archived)| old == &body && !archived)
+                {
+                    continue;
+                }
+                sqlx::query("INSERT INTO items (id, body, brand, sort_brand, name, sort_name, category, sku, confirmed, archived, revision, styling_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?) ON CONFLICT(id) DO UPDATE SET body=excluded.body, brand=excluded.brand, sort_brand=excluded.sort_brand, name=excluded.name, sort_name=excluded.sort_name, category=excluded.category, sku=excluded.sku, confirmed=excluded.confirmed, archived=0, revision=items.revision+1, styling_hash=excluded.styling_hash")
+                    .bind(&item.id).bind(body).bind(&item.brand).bind(item.brand.as_deref().unwrap_or("").to_lowercase())
+                    .bind(&item.name).bind(item.name.to_lowercase()).bind(&item.category).bind(item.sku.as_deref().map(str::to_lowercase))
+                    .bind(item.current_ownership_confirmed).bind(styling_hash(item)?)
+                    .execute(&mut *tx).await?;
+            }
+            for (id, (_, archived)) in &existing {
+                if !archived && !source.contains_key(id.as_str()) {
+                    sqlx::query("UPDATE items SET archived=1, revision=revision+1 WHERE id=?")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            report.catalog_revision += 1;
+            sqlx::query("UPDATE catalog_state SET revision=?, source_hash=? WHERE singleton=1")
+                .bind(report.catalog_revision)
+                .bind(&report.source_hash)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("INSERT INTO operations (scope, actor, key, request_hash, response) VALUES ('sync', ?, ?, ?, ?)")
+            .bind(actor).bind(key).bind(input_hash).bind(serde_json::to_string(&report)?).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(report)
+    }
+
+    pub async fn reserve_generation(
+        &self,
+        inputs: TodayRequest,
+        basis: GenerationBasis,
+        actor: &str,
+        key: &str,
+    ) -> Result<Reservation> {
+        let input_hash = hash(&serde_json::to_vec(&inputs)?);
+        let mut tx = self.pool.begin().await?;
+        if let Some(row) = operation(&mut tx, "today", actor, key).await? {
+            if row.try_get::<String, _>("request_hash")? != input_hash {
+                return Err(StoreError::Conflict("idempotency_conflict"));
+            }
+            let id: String = row.try_get("resource_id")?;
+            let generation = generation(&mut tx, &id).await?;
+            tx.commit().await?;
+            return Ok(Reservation {
+                generation,
+                fresh: false,
+            });
+        }
+        if sqlx::query_scalar::<_, bool>(RUNNING_EXISTS_SQL)
+            .fetch_one(&mut *tx)
+            .await?
+        {
+            return Err(StoreError::Conflict("generation_in_progress"));
+        }
+        let generation = Generation {
+            id: uuid::Uuid::now_v7().to_string(),
+            status: GenerationStatus::Running,
+            inputs,
+            started_at: Utc::now(),
+            finished_at: None,
+            error_code: None,
+        };
+        sqlx::query("INSERT INTO generations (id,local_date,timezone,config_hash,status,body,basis,started_at) VALUES (?,?,?,?,'running',?,?,?)")
+            .bind(&generation.id).bind(&basis.date).bind(&basis.timezone).bind(&basis.config_hash)
+            .bind(serde_json::to_string(&generation)?).bind(serde_json::to_string(&basis)?)
+            .bind(generation.started_at.to_rfc3339()).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO operations (scope,actor,key,request_hash,resource_id) VALUES ('today',?,?,?,?)")
+            .bind(actor).bind(key).bind(input_hash).bind(&generation.id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Reservation {
+            generation,
+            fresh: true,
+        })
+    }
+
+    pub async fn finish_generation(
+        &self,
+        id: &str,
+        result: std::result::Result<TodayResult, &str>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let mut operation = generation(&mut tx, id).await?;
+        if operation.status != GenerationStatus::Running {
+            return Ok(());
+        }
+        let row = sqlx::query(GENERATION_BASIS_SQL)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let basis: GenerationBasis = serde_json::from_str(row.try_get("basis")?)?;
+        let outcome = match result {
+            Ok(result) => {
+                let signatures = referenced_signatures(&basis.items, &result)?;
+                if signatures_current(&mut tx, &signatures, &result.inputs).await? {
+                    sqlx::query("INSERT INTO today_results (local_date,timezone,config_hash,body,signatures) VALUES (?,?,?,?,?) ON CONFLICT(local_date) DO UPDATE SET timezone=excluded.timezone, config_hash=excluded.config_hash, body=excluded.body, signatures=excluded.signatures")
+                        .bind(&basis.date).bind(&basis.timezone).bind(&basis.config_hash).bind(serde_json::to_string(&result)?)
+                        .bind(serde_json::to_string(&signatures)?).execute(&mut *tx).await?;
+                    Ok(())
+                } else {
+                    Err("referenced_items_changed")
+                }
+            }
+            Err(code) => Err(code),
+        };
+        operation.status = if outcome.is_ok() {
+            GenerationStatus::Succeeded
+        } else {
+            GenerationStatus::Failed
+        };
+        operation.error_code = outcome.err().map(str::to_owned);
+        operation.finished_at = Some(Utc::now());
+        save_generation(&mut tx, &operation).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn today(
+        &self,
+        date: &str,
+        timezone: &str,
+        config_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<TodayResponse> {
+        let mut tx = self.pool.begin().await?;
+        let generation = sqlx::query_scalar::<_, String>(CURRENT_GENERATION_SQL)
+            .bind(date)
+            .bind(timezone)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|body| serde_json::from_str(&body))
+            .transpose()?;
+        let row = sqlx::query(TODAY_RESULT_SQL)
+            .bind(date)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let result = if let Some(row) = row {
+            let mut result: TodayResult = serde_json::from_str(row.try_get("body")?)?;
+            let signatures: BTreeMap<String, String> =
+                serde_json::from_str(row.try_get("signatures")?)?;
+            if row.try_get::<String, _>("config_hash")? != config_hash
+                || row.try_get::<String, _>("timezone")? != timezone
+            {
+                result.stale_reasons.push("configuration_changed".into());
+            }
+            if result.expires_at <= now {
+                result.stale_reasons.push("expired".into());
+            }
+            if !signatures_current(&mut tx, &signatures, &result.inputs).await? {
+                result.stale_reasons.push("referenced_items_changed".into());
+            }
+            result.stale_reasons.sort();
+            result.stale_reasons.dedup();
+            if !result.stale_reasons.is_empty() {
+                result.freshness = Freshness::Stale;
+            }
+            Some(result)
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(TodayResponse {
+            date: date.into(),
+            timezone: timezone.into(),
+            result,
+            generation,
+        })
+    }
+
+    async fn interrupt_running(&self) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query_scalar::<_, String>(RUNNING_GENERATIONS_SQL)
+            .fetch_all(&mut *tx)
+            .await?;
+        for body in rows {
+            let mut generation: Generation = serde_json::from_str(&body)?;
+            generation.status = GenerationStatus::Interrupted;
+            generation.finished_at = Some(Utc::now());
+            generation.error_code = Some("interrupted".into());
+            save_generation(&mut tx, &generation).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+async fn state(connection: &mut SqliteConnection) -> Result<(i64, String)> {
+    let row = sqlx::query(STATE_SQL).fetch_one(connection).await?;
+    Ok((row.try_get("revision")?, row.try_get("source_hash")?))
+}
+async fn operation(
+    connection: &mut SqliteConnection,
+    scope: &str,
+    actor: &str,
+    key: &str,
+) -> Result<Option<SqliteRow>> {
+    Ok(sqlx::query(OPERATION_SQL)
+        .bind(scope)
+        .bind(actor)
+        .bind(key)
+        .fetch_optional(connection)
+        .await?)
+}
+async fn generation(connection: &mut SqliteConnection, id: &str) -> Result<Generation> {
+    let body: String = sqlx::query_scalar(GENERATION_SQL)
+        .bind(id)
+        .fetch_optional(connection)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+    Ok(serde_json::from_str(&body)?)
+}
+async fn save_generation(connection: &mut SqliteConnection, generation: &Generation) -> Result<()> {
+    let status = match generation.status {
+        GenerationStatus::Running => "running",
+        GenerationStatus::Succeeded => "succeeded",
+        GenerationStatus::Failed => "failed",
+        GenerationStatus::Interrupted => "interrupted",
+    };
+    sqlx::query("UPDATE generations SET body=?, status=? WHERE id=?")
+        .bind(serde_json::to_string(generation)?)
+        .bind(status)
+        .bind(&generation.id)
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+fn decode_item(row: &SqliteRow) -> Result<Item> {
+    Ok(Item {
+        catalog: serde_json::from_str(row.try_get("body")?)?,
+        revision: row.try_get("revision")?,
+        archived: row.try_get("archived")?,
+    })
+}
+fn validate_filters(filters: &ItemFilters) -> Result<()> {
+    if filters
+        .q
+        .as_ref()
+        .is_some_and(|value| value.len() > 256 || value.chars().any(char::is_control))
+        || filters
+            .brand
+            .as_ref()
+            .is_some_and(|value| value.len() > 1024)
+        || filters
+            .category
+            .as_ref()
+            .is_some_and(|value| value.len() > 200)
+    {
+        return Err(StoreError::Invalid("invalid_filter"));
+    }
+    Ok(())
+}
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+fn add_filters(query: &mut QueryBuilder<Sqlite>, filters: &ItemFilters) {
+    if let Some(q) = filters.q.as_deref().filter(|q| !q.trim().is_empty()) {
+        let pattern = format!("%{}%", escape_like(&q.to_lowercase()));
+        query
+            .push(" AND (sort_brand LIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR sort_name LIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR coalesce(sku,'') LIKE ")
+            .push_bind(pattern)
+            .push(" ESCAPE '\\')");
+    }
+    if let Some(brand) = &filters.brand {
+        query
+            .push(" AND sort_brand=")
+            .push_bind(brand.to_lowercase());
+    }
+    if let Some(category) = &filters.category {
+        query
+            .push(" AND (category=")
+            .push_bind(category.clone())
+            .push(" OR category LIKE ")
+            .push_bind(format!("{}.%", escape_like(category)))
+            .push(" ESCAPE '\\')");
+    }
+    if filters.confirmed_only == Some(true) {
+        query.push(" AND confirmed=1");
+    }
+}
+fn count_selection(filters: &ItemFilters) -> QueryBuilder<Sqlite> {
+    let mut query = QueryBuilder::<Sqlite>::new(SCOPE_COUNT_SQL);
+    add_filters(&mut query, filters);
+    query
+}
+fn selection(filters: &ItemFilters, cursor: Option<&Cursor>, limit: u32) -> QueryBuilder<Sqlite> {
+    let mut select = QueryBuilder::<Sqlite>::new(
+        "SELECT id, body, revision, archived, sort_brand, sort_name FROM items WHERE archived = 0",
+    );
+    add_filters(&mut select, filters);
+    if let Some(cursor) = cursor {
+        select
+            .push(" AND (sort_brand, sort_name, id) > (")
+            .push_bind(cursor.brand.clone())
+            .push(", ")
+            .push_bind(cursor.name.clone())
+            .push(", ")
+            .push_bind(cursor.id.clone())
+            .push(")");
+    }
+    select
+        .push(" ORDER BY sort_brand, sort_name, id LIMIT ")
+        .push_bind(i64::from(limit) + 1);
+    select
+}
+fn reconciliation(items: &[CatalogItem]) -> QueryBuilder<Sqlite> {
+    // Reconciliation needs the active catalog and only source IDs being restored,
+    // never unrelated archived records or their historical JSON bodies.
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT id, CASE WHEN archived=0 THEN body ELSE '' END AS body, archived FROM items WHERE archived=0",
+    );
+    if !items.is_empty() {
+        query.push(" OR id IN (");
+        let mut values = query.separated(", ");
+        for item in items {
+            values.push_bind(item.id.clone());
+        }
+        values.push_unseparated(")");
+    }
+    query
+}
+fn encode_cursor(cursor: &Cursor) -> Result<String> {
+    Ok(serde_json::to_vec(cursor)?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+fn decode_cursor(token: &str) -> Result<Cursor> {
+    if token.len() > 8192 || !token.len().is_multiple_of(2) || !token.is_ascii() {
+        return Err(StoreError::Invalid("invalid_page_token"));
+    }
+    let bytes = (0..token.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&token[index..index + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| StoreError::Invalid("invalid_page_token"))?;
+    let cursor: Cursor =
+        serde_json::from_slice(&bytes).map_err(|_| StoreError::Invalid("invalid_page_token"))?;
+    validate_filters(&cursor.filters)?;
+    Ok(cursor)
+}
+fn referenced_signatures(
+    items: &[CatalogItem],
+    result: &TodayResult,
+) -> Result<BTreeMap<String, String>> {
+    let candidates: BTreeMap<&str, &CatalogItem> =
+        items.iter().map(|item| (item.id.as_str(), item)).collect();
+    let mut signatures = BTreeMap::new();
+    for id in result
+        .suggestions
+        .iter()
+        .flat_map(|suggestion| &suggestion.item_ids)
+    {
+        let item = candidates
+            .get(id.as_str())
+            .ok_or(StoreError::Invalid("invalid_model_output"))?;
+        signatures.insert(id.clone(), styling_hash(item)?);
+    }
+    Ok(signatures)
+}
+async fn signatures_current(
+    connection: &mut SqliteConnection,
+    signatures: &BTreeMap<String, String>,
+    inputs: &TodayRequest,
+) -> Result<bool> {
+    if signatures.is_empty() {
+        return Ok(true);
+    }
+    let mut select = signature_selection(signatures);
+    let rows = select.build().fetch_all(connection).await?;
+    if rows.len() != signatures.len() {
+        return Ok(false);
+    }
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        if signatures.get(&id) != Some(&row.try_get::<String, _>("styling_hash")?)
+            || row.try_get::<bool, _>("archived")?
+            || (inputs.ownership_scope == OwnershipScope::ConfirmedOnly
+                && !row.try_get::<bool, _>("confirmed")?)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+fn signature_selection(signatures: &BTreeMap<String, String>) -> QueryBuilder<Sqlite> {
+    let mut select = QueryBuilder::<Sqlite>::new(
+        "SELECT id, styling_hash, archived, confirmed FROM items WHERE id IN (",
+    );
+    let mut values = select.separated(", ");
+    for id in signatures.keys() {
+        values.push_bind(id.clone());
+    }
+    values.push_unseparated(")");
+    select
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use chrono::{Duration, Utc};
+    use sqlx::{Execute, QueryBuilder};
+
+    use crate::{
+        models::{
+            CatalogItem, Generation, GenerationStatus, ItemFilters, SyncRequest, TodayRequest,
+        },
+        store::{
+            ACTIVE_ITEMS_SQL, BRANDS_SQL, CATEGORIES_SQL, COUNTS_SQL, CURRENT_GENERATION_SQL,
+            GENERATION_BASIS_SQL, GENERATION_SQL, GenerationBasis, ITEM_SQL, OPERATION_SQL,
+            RUNNING_EXISTS_SQL, RUNNING_GENERATIONS_SQL, SCOPE_COUNT_SQL, STATE_SQL, Store,
+            TODAY_RESULT_SQL, count_selection, reconciliation, selection, signature_selection,
+        },
+    };
+
+    fn example(index: usize) -> CatalogItem {
+        CatalogItem {
+            id: format!("example-{index:04}"),
+            brand: Some(format!("Label {}", index % 20)),
+            name: format!("Piece {index:04}"),
+            category: if index.is_multiple_of(2) {
+                "clothing.top".into()
+            } else {
+                "footwear.shoes".into()
+            },
+            color: None,
+            size: None,
+            quantity: Some(1),
+            material: None,
+            sku: None,
+            purchase_source: None,
+            current_ownership_confirmed: index.is_multiple_of(3),
+            images: Vec::new(),
+            condition_at_purchase: None,
+            notes: Vec::new(),
+            price: None,
+            shop: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_list_query_plans_on_a_representative_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("plans.sqlite3"))
+            .await
+            .unwrap();
+        store
+            .sync(
+                SyncRequest {
+                    items: (0..1250).map(example).collect(),
+                    dry_run: false,
+                    allow_empty: false,
+                },
+                Some(0),
+                "example-owner",
+                Some("all"),
+            )
+            .await
+            .unwrap();
+        store
+            .sync(
+                SyncRequest {
+                    items: (0..1000).map(example).collect(),
+                    dry_run: false,
+                    allow_empty: false,
+                },
+                Some(1),
+                "example-owner",
+                Some("active"),
+            )
+            .await
+            .unwrap();
+        let mut revision = 2;
+        for batch in 0..4 {
+            let start = 1250 + batch * 1000;
+            let key = format!("history-batch-{batch}");
+            let report = store
+                .sync(
+                    SyncRequest {
+                        items: (start..start + 1000).map(example).collect(),
+                        dry_run: false,
+                        allow_empty: false,
+                    },
+                    Some(revision),
+                    "example-owner",
+                    Some(&key),
+                )
+                .await
+                .unwrap();
+            revision = report.catalog_revision;
+        }
+        let (_, active, _, archived) = store.counts().await.unwrap();
+        assert_eq!((active, archived), (1000, 4250));
+        let mut tx = store.pool.begin().await.unwrap();
+        for day in 0..365 {
+            let started_at = Utc::now() - Duration::days(day);
+            let date = started_at.date_naive().to_string();
+            let basis = GenerationBasis {
+                date: date.clone(),
+                timezone: "UTC".into(),
+                config_hash: "example-config".into(),
+                items: Vec::new(),
+            };
+            let generation = Generation {
+                id: format!("example-generation-{day}"),
+                status: GenerationStatus::Failed,
+                inputs: TodayRequest::default(),
+                started_at,
+                finished_at: Some(started_at),
+                error_code: Some("example-failure".into()),
+            };
+            sqlx::query("INSERT INTO generations (id,local_date,timezone,config_hash,status,body,basis,started_at) VALUES (?,?,?,?,'failed',?,?,?)")
+                .bind(&generation.id).bind(&date).bind("UTC").bind("example-config").bind(serde_json::to_string(&generation).unwrap()).bind(serde_json::to_string(&basis).unwrap()).bind(started_at.to_rfc3339()).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO operations (scope,actor,key,request_hash,resource_id) VALUES ('today',?,?,?,?)").bind("example-owner").bind(format!("example-operation-{day}")).bind("example-hash").bind(&generation.id).execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        sqlx::query("ANALYZE").execute(&store.pool).await.unwrap();
+        for (name, mut query) in [
+            ("aggregate counts", sqlx::query(COUNTS_SQL)),
+            ("item by ID", sqlx::query(ITEM_SQL).bind("example-4300")),
+            ("active candidate input", sqlx::query(ACTIVE_ITEMS_SQL)),
+            ("scope count", sqlx::query(SCOPE_COUNT_SQL)),
+            ("brand facets", sqlx::query(BRANDS_SQL)),
+            ("category facets", sqlx::query(CATEGORIES_SQL)),
+            ("running existence", sqlx::query(RUNNING_EXISTS_SQL)),
+            (
+                "current daily attempt",
+                sqlx::query(CURRENT_GENERATION_SQL)
+                    .bind(Utc::now().date_naive().to_string())
+                    .bind("UTC"),
+            ),
+            (
+                "generation input",
+                sqlx::query(GENERATION_BASIS_SQL).bind("example-generation-10"),
+            ),
+            (
+                "daily result",
+                sqlx::query(TODAY_RESULT_SQL).bind(Utc::now().date_naive().to_string()),
+            ),
+            ("startup interruption", sqlx::query(RUNNING_GENERATIONS_SQL)),
+            ("catalog state", sqlx::query(STATE_SQL)),
+            (
+                "operation replay",
+                sqlx::query(OPERATION_SQL)
+                    .bind("today")
+                    .bind("example-owner")
+                    .bind("example-operation-10"),
+            ),
+            (
+                "generation by ID",
+                sqlx::query(GENERATION_SQL).bind("example-generation-10"),
+            ),
+        ] {
+            let arguments = query.take_arguments().unwrap().unwrap();
+            let mut explain = QueryBuilder::<sqlx::Sqlite>::new("EXPLAIN QUERY PLAN ");
+            explain.push(query.sql().as_str());
+            let rows = sqlx::query_with::<sqlx::Sqlite, _>(explain.into_sql(), arguments)
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+            let plans: Vec<String> = rows
+                .iter()
+                .map(|row| sqlx::Row::get(row, "detail"))
+                .collect();
+            println!("{name}: {}", plans.join("; "));
+        }
+        for (name, filters) in [
+            ("first page", ItemFilters::default()),
+            (
+                "brand",
+                ItemFilters {
+                    brand: Some("Label 2".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "category descendants",
+                ItemFilters {
+                    category: Some("clothing.top".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "substring search",
+                ItemFilters {
+                    q: Some("Piece 430".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "confirmed brand",
+                ItemFilters {
+                    brand: Some("Label 2".into()),
+                    confirmed_only: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            for (kind, mut builder) in [
+                ("page", selection(&filters, None, 50)),
+                ("count", count_selection(&filters)),
+            ] {
+                let mut query = builder.build();
+                let arguments = query.take_arguments().unwrap().unwrap();
+                let mut explain = QueryBuilder::<sqlx::Sqlite>::new("EXPLAIN QUERY PLAN ");
+                explain.push(query.sql().as_str());
+                let rows = sqlx::query_with::<sqlx::Sqlite, _>(explain.into_sql(), arguments)
+                    .fetch_all(&store.pool)
+                    .await
+                    .unwrap();
+                let plans: Vec<String> = rows
+                    .iter()
+                    .map(|row| sqlx::Row::get(row, "detail"))
+                    .collect();
+                assert!(!plans.is_empty());
+                println!("{name} {kind}: {}", plans.join("; "));
+            }
+        }
+        let signatures = BTreeMap::from([
+            ("example-4300".into(), "example-hash".into()),
+            ("example-4301".into(), "example-hash".into()),
+        ]);
+        let mut builder = signature_selection(&signatures);
+        let mut query = builder.build();
+        let arguments = query.take_arguments().unwrap().unwrap();
+        let mut explain = QueryBuilder::<sqlx::Sqlite>::new("EXPLAIN QUERY PLAN ");
+        explain.push(query.sql().as_str());
+        let rows = sqlx::query_with::<sqlx::Sqlite, _>(explain.into_sql(), arguments)
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        let plans: Vec<String> = rows
+            .iter()
+            .map(|row| sqlx::Row::get(row, "detail"))
+            .collect();
+        println!("referenced fact validation: {}", plans.join("; "));
+        let subset: Vec<_> = [5, 4995, 9000].into_iter().map(example).collect();
+        let previous =
+            sqlx::query("EXPLAIN QUERY PLAN SELECT id, body, archived, revision FROM items")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        let before: Vec<String> = previous
+            .iter()
+            .map(|row| sqlx::Row::get(row, "detail"))
+            .collect();
+        println!("previous full-history sync: {}", before.join("; "));
+        let mut builder = reconciliation(&subset);
+        let mut query = builder.build();
+        let arguments = query.take_arguments().unwrap().unwrap();
+        let mut explain = QueryBuilder::<sqlx::Sqlite>::new("EXPLAIN QUERY PLAN ");
+        explain.push(query.sql().as_str());
+        let rows = sqlx::query_with::<sqlx::Sqlite, _>(explain.into_sql(), arguments)
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        let plans: Vec<String> = rows
+            .iter()
+            .map(|row| sqlx::Row::get(row, "detail"))
+            .collect();
+        println!("sync active/source IDs only: {}", plans.join("; "));
+        store.close().await;
+    }
+}

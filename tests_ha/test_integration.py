@@ -1,0 +1,366 @@
+"""Real HA flows, scoped HTTP bridge, entities and Assist against Rust."""
+
+import json
+from uuid import uuid4
+
+import probatio
+import pytest
+from aiohttp import ClientSession
+from homeassistant.components.homeassistant.exposed_entities import async_expose_entity
+from homeassistant.config_entries import (
+    SOURCE_HASSIO,
+    SOURCE_REAUTH,
+    SOURCE_USER,
+    ConfigEntryState,
+)
+from homeassistant.core import Context, HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import llm
+from homeassistant.helpers.service_info.hassio import HassioServiceInfo
+from homeassistant.setup import async_setup_component
+from pytest_homeassistant_custom_component.common import MockConfigEntry, MockUser
+from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
+
+from custom_components.closet import ClosetConfigEntry
+from custom_components.closet.const import CONF_BACKEND_URL, CONF_TOKEN, DOMAIN
+from custom_components.closet.diagnostics import async_get_config_entry_diagnostics
+
+from .conftest import RustBackend, catalog_item
+
+PREFIX = "/api/closet/v1"
+
+
+async def connect(hass: HomeAssistant, backend: RustBackend) -> ClosetConfigEntry:
+    """Use the actual standalone flow, not a hand-created runtime coordinator."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "standalone"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_BACKEND_URL: backend.origin, CONF_TOKEN: backend.integration_token},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    entry = result["result"]
+    assert entry.state is ConfigEntryState.LOADED
+    return entry
+
+
+async def test_flow_counts_diagnostics_and_unload(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator, rust_backend: RustBackend
+) -> None:
+    await rust_backend.sync([catalog_item(confirmed=True)])
+    entry = await connect(hass, rust_backend)
+    registry = er.async_get(hass)
+    item_entity = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_item_count"
+    )
+    confirmed = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_confirmed_count"
+    )
+    assert item_entity is not None and confirmed is not None
+    item_state = hass.states.get(item_entity)
+    confirmed_state = hass.states.get(confirmed)
+    assert item_state is not None and item_state.state == "1"
+    assert confirmed_state is not None and confirmed_state.state == "1"
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+    assert diagnostics["item_count"] == 1
+    rendered = json.dumps(diagnostics)
+    assert "example-tee" not in rendered
+    assert "Example cotton tee" not in rendered
+    assert rust_backend.integration_token not in rendered
+    assert rust_backend.origin not in rendered
+    client = await hass_client()
+    assert (await client.get(f"{PREFIX}/items")).status == 200
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert (await client.get(f"{PREFIX}/items")).status == 503
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    reloaded_state = hass.states.get(item_entity)
+    assert reloaded_state is not None and reloaded_state.state == "1"
+
+
+async def test_admin_sync_and_untrusted_actor_headers(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_user_token: str,
+    rust_backend: RustBackend,
+) -> None:
+    entry = await connect(hass, rust_backend)
+    user = await hass_client(hass_user_token)
+    body = {"items": [catalog_item()], "dry_run": False, "allow_empty": False}
+    headers = {
+        "If-Match": '"0"',
+        "Idempotency-Key": "ha-catalog-sync",
+        "X-Closet-Actor-Id": "ha:forged",
+        "X-Closet-Admin": "true",
+    }
+    assert (
+        await user.post(f"{PREFIX}/inventory/sync", json=body, headers=headers)
+    ).status == 403
+    assert (await user.post(f"{PREFIX}/today/generate", json={})).status == 403
+    admin = await hass_client()
+    applied = await admin.post(f"{PREFIX}/inventory/sync", json=body, headers=headers)
+    assert applied.status == 200, await applied.text()
+    await hass.async_block_till_done()
+    data = await (await user.get(f"{PREFIX}/items")).json()
+    assert data["total"] == 1
+    assert data["items"][0]["id"] == "example-tee"
+    assert entry.runtime_data.data.item_count == 1
+    async with ClientSession() as native:
+        response = await native.post(
+            f"{rust_backend.origin}/v1/inventory/sync",
+            json=body,
+            headers={
+                "Authorization": f"Bearer {rust_backend.integration_token}",
+                "If-Match": '"1"',
+                "Idempotency-Key": "unattributed",
+            },
+        )
+        assert response.status == 403
+
+
+async def test_proxy_reads_every_valid_leading_item_character(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    rust_backend: RustBackend,
+) -> None:
+    """The HA read surface accepts the catalog validator's whole ID alphabet."""
+    identifiers = ["_example", "-example", ".example", ":example", "a" * 200]
+    await rust_backend.sync([catalog_item(item_id) for item_id in identifiers])
+    await connect(hass, rust_backend)
+    client = await hass_client()
+    for item_id in identifiers:
+        response = await client.get(f"{PREFIX}/items/{item_id}")
+        assert response.status == 200, await response.text()
+        assert (await response.json())["id"] == item_id
+    for invalid in [".", "..", "x" * 201, "not!an!id"]:
+        assert (await client.get(f"{PREFIX}/items/{invalid}")).status == 404
+
+
+async def test_proxy_sync_accepts_valid_catalog_plus_request_envelope(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    rust_backend: RustBackend,
+) -> None:
+    """A valid near-1-MiB catalog still fits after sync adds its envelope."""
+    records = [catalog_item(f"large-example-{index}") for index in range(4)]
+    for record in records:
+        record.update(condition_at_purchase=None, price=None, shop=None)
+        record["notes"] = ["x" * 2614 for _ in range(100)]
+    # Match the Rust compact catalog size, leaving room for no more than 16 bytes.
+    target_bytes = 1_048_560
+    encoded = json.dumps(records, separators=(",", ":"))
+    remaining = target_bytes - len(encoded.encode())
+    assert 0 <= remaining <= 4096 - 2614
+    records[-1]["notes"] = ["x" * (2614 + remaining)] + ["x" * 2614] * 99
+    catalog = json.dumps(records, separators=(",", ":"))
+    assert len(catalog.encode()) == target_bytes
+    await connect(hass, rust_backend)
+    client = await hass_client()
+    validated = await client.post(
+        f"{PREFIX}/inventory/validate",
+        data=catalog,
+        headers={"Content-Type": "application/json"},
+    )
+    assert validated.status == 200, await validated.text()
+    body = '{"items":' + catalog + ',"dry_run":false,"allow_empty":false}'
+    assert len(body.encode()) > 1_048_576
+    synced = await client.post(
+        f"{PREFIX}/inventory/sync",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "If-Match": '"0"',
+            "Idempotency-Key": "large-ha-catalog-sync",
+        },
+    )
+    assert synced.status == 200, await synced.text()
+    listing = await (await client.get(f"{PREFIX}/items")).json()
+    assert listing["total"] == 4
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "status"),
+    [
+        ("get", "credentials", 404),
+        ("post", "items", 405),
+        ("get", "items?url=https://example.invalid", 400),
+        ("get", "system?limit=1", 400),
+        ("post", "today/generate?url=x", 400),
+    ],
+)
+async def test_proxy_has_fixed_route_query_and_method_scope(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    rust_backend: RustBackend,
+    method: str,
+    path: str,
+    status: int,
+) -> None:
+    await connect(hass, rust_backend)
+    client = await hass_client()
+    response = await getattr(client, method)(f"{PREFIX}/{path}")
+    assert response.status == status
+
+
+async def test_owner_token_cannot_be_saved_as_integration(
+    hass: HomeAssistant, rust_backend: RustBackend
+) -> None:
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "standalone"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_BACKEND_URL: rust_backend.origin, CONF_TOKEN: rust_backend.owner_token},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "integration_required"}
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
+async def test_supervisor_discovery_requires_confirmation(
+    hass: HomeAssistant, rust_backend: RustBackend
+) -> None:
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_HASSIO},
+        data=HassioServiceInfo(
+            config={
+                CONF_BACKEND_URL: rust_backend.origin,
+                CONF_TOKEN: rust_backend.integration_token,
+            },
+            name="Closet",
+            slug="example_closet",
+            uuid=uuid4().hex,
+        ),
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "hassio_confirm"
+    assert not hass.config_entries.async_entries(DOMAIN)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+
+
+async def test_reauth_replaces_credential_without_duplicate_entry(
+    hass: HomeAssistant, rust_backend: RustBackend
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_BACKEND_URL: rust_backend.origin,
+            CONF_TOKEN: "expired-example-token",
+        },
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    assert result["step_id"] == "reauth_confirm"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_BACKEND_URL: rust_backend.origin,
+            CONF_TOKEN: rust_backend.integration_token,
+        },
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    await hass.async_block_till_done()
+    assert entry.data[CONF_TOKEN] == rust_backend.integration_token
+    assert len(hass.config_entries.async_entries(DOMAIN)) == 1
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://user:secret@localhost",
+        "http://localhost/path",
+        "https://localhost?next=x",
+        "http://localhost:0",
+    ],
+)
+async def test_standalone_rejects_non_origin_before_request(
+    hass: HomeAssistant, origin: str
+) -> None:
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "standalone"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_BACKEND_URL: origin, CONF_TOKEN: "test-token"}
+    )
+    assert result["errors"] == {CONF_BACKEND_URL: "invalid_url"}
+
+
+async def test_assist_reads_actual_inventory_and_respects_revoked_exposure(
+    hass: HomeAssistant, rust_backend: RustBackend, hass_user: MockUser
+) -> None:
+    record = catalog_item()
+    record["purchase_source"] = "excluded-example-provenance"
+    record["notes"] = ["excluded-example-source-note"]
+    await rust_backend.sync([record])
+    entry = await connect(hass, rust_backend)
+    entity_id = er.async_get(hass).async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_item_count"
+    )
+    assert entity_id is not None
+    assert await async_setup_component(hass, "homeassistant", {})
+    assert await async_setup_component(hass, "llm", {})
+    context = llm.LLMContext(
+        platform="test",
+        context=Context(user_id=hass_user.id),
+        language="en",
+        assistant="conversation",
+        device_id=None,
+    )
+    async_expose_entity(hass, "conversation", entity_id, False)
+    api = await llm.async_get_api(hass, "assist", context)
+    assert not {tool.name for tool in api.tools if tool.integration == DOMAIN}
+    async_expose_entity(hass, "conversation", entity_id, True)
+    api = await llm.async_get_api(hass, "assist", context)
+    assert {tool.name for tool in api.tools if tool.integration == DOMAIN} == {
+        "closet__query",
+        "closet__today",
+    }
+    for tool in api.tools:
+        if tool.integration != DOMAIN:
+            continue
+        schema = probatio.to_openapi(
+            tool.parameters,
+            custom_serializer=api.custom_serializer,
+            openapi_version="3.1.0",
+        )
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
+        json.dumps(schema)
+    result = await api.async_call_tool(
+        llm.ToolInput(tool_name="closet__query", tool_args={"q": "cotton"})
+    )
+    assert not result.error
+    serialized = json.dumps(result.data)
+    assert "example-tee" in serialized
+    assert "excluded-example-provenance" not in serialized
+    assert "excluded-example-source-note" not in serialized
+    today = await api.async_call_tool(
+        llm.ToolInput(tool_name="closet__today", tool_args={})
+    )
+    assert today.data["generation"] is None
+    async_expose_entity(hass, "conversation", entity_id, False)
+    revoked = await api.async_call_tool(
+        llm.ToolInput(tool_name="closet__query", tool_args={})
+    )
+    assert revoked.error
+    assert revoked.data == {"error": "not_exposed"}

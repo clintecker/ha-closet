@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Reject accidental credentials and private runtime data before publication.
+
+Inspect the current tree (including hidden and untracked files) and every Git
+blob reachable from any local ref. Findings contain paths and categories only.
+This gate complements review; it cannot identify every personal detail.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+from urllib.parse import urlsplit
+
+# Build environments are deliberately excluded from the worktree scan. Tracked
+# copies remain subject to the history scan, including files under these names.
+BUILD_DIRECTORIES = {
+    ".git",
+    ".direnv",
+    ".venv",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "node_modules",
+    "target",
+    "work",
+    ".ty_cache",
+}
+FORBIDDEN_NAMES = {
+    "items.json",
+    "wardrobe-inventory.json",
+    "credentials.json",
+    "options.json",
+    "secrets.yaml",
+    "secrets.yml",
+    "id_rsa",
+    "id_ed25519",
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    "csrf.key",
+}
+PRIVATE_DIRECTORIES = {
+    "private",
+    ".private",
+    "backups",
+    ".backups",
+    "runtime",
+    ".runtime",
+}
+FORBIDDEN_SUFFIXES = {
+    ".db",
+    ".db-shm",
+    ".db-wal",
+    ".sqlite",
+    ".sqlite3",
+    ".sqlite-journal",
+    ".sqlite3-shm",
+    ".sqlite3-wal",
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".har",
+    ".pcap",
+    ".pcapng",
+}
+PATTERNS = {
+    "private key": re.compile(
+        rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+    ),
+    "provider credential": re.compile(
+        rb"(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|"
+        rb"sk-(?:proj-|ant-)?[A-Za-z0-9_-]{24,}|AKIA[0-9A-Z]{16}|"
+        rb"xox[baprs]-[0-9A-Za-z-]{20,}|AIza[0-9A-Za-z_-]{30,})"
+    ),
+    "bearer credential": re.compile(rb"Bearer [A-Za-z0-9._~-]{32,}"),
+    "private endpoint": re.compile(
+        rb"https?://(?:192\.168\.[0-9]{1,3}\.[0-9]{1,3}|10\.[0-9]{1,3}\.[0-9]{1,3}\."
+        rb"[0-9]{1,3}|172\.(?:1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3})"
+        rb"(?::[0-9]+)?(?:[/\s\"']|$)"
+    ),
+    "long-lived Home Assistant credential": re.compile(
+        rb"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}"
+    ),
+}
+# The Supervisor gateway is an upstream protocol default, not household data.
+SUPERVISOR_ENDPOINT = re.compile(rb"https?://172\.30\.32\.2(?::[0-9]+)?(?=[/\s\"']|$)")
+
+
+def git(*args: str) -> bytes:
+    return subprocess.check_output(["git", *args])
+
+
+def private_strings() -> tuple[bytes, ...]:
+    configured = os.environ.get("CLOSET_PRIVATE_CATALOG")
+    if not configured:
+        return ()
+    try:
+        catalog = json.loads(Path(configured).read_text())
+    except (OSError, ValueError):
+        raise SystemExit(
+            "Private catalog comparison is unavailable or invalid"
+        ) from None
+
+    def strings(value: object) -> set[bytes]:
+        if isinstance(value, list):
+            return set().union(*(strings(item) for item in value))
+        if not isinstance(value, dict):
+            return set()
+        selected: set[bytes] = set()
+        # Compare purchase identities and product-specific evidence, not generic
+        # schema vocabulary such as image kind, color, currency or confidence.
+        for field in ("id", "name", "sku", "url", "source_url"):
+            content = value.get(field)
+            if isinstance(content, str) and len(content) >= 8:
+                selected.add(content.encode())
+        images = value.get("images")
+        if isinstance(images, list):
+            selected.update(strings(images))
+        return selected
+
+
+    return tuple(sorted(strings(catalog)))
+
+
+def fictional_catalog(data: bytes) -> bool:
+    """The public sample has invented IDs and only example or own-asset URLs."""
+    try:
+        catalog = json.loads(data)
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(catalog, list) or not catalog:
+        return False
+    for item in catalog:
+        if not isinstance(item, dict) or not str(item.get("id", "")).startswith("example-"):
+            return False
+        for image in item.get("images", []):
+            for field in ("url", "source_url"):
+                value = image.get(field)
+                if value is None:
+                    continue
+                try:
+                    parsed = urlsplit(value)
+                    example = parsed.hostname in {"example.com", "example.invalid"}
+                    own_asset = parsed.hostname == "raw.githubusercontent.com" and (
+                        parsed.path.startswith("/jessfraz/ha-closet/")
+                    )
+                    if not (parsed.scheme == "https" and not parsed.username
+                            and not parsed.password and (example or own_asset)):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+    return True
+
+
+def inspect(path: str, data: bytes, private: tuple[bytes, ...]) -> set[str]:
+    categories: set[str] = set()
+    if path == "config/catalog.example.json" and not fictional_catalog(data):
+        categories.add("example catalog must remain explicitly fictional")
+    components = Path(path).parts
+    name = Path(path).name.lower()
+    if any(component.lower() in PRIVATE_DIRECTORIES for component in components[:-1]):
+        categories.add("private or runtime directory")
+    if name in FORBIDDEN_NAMES or any(
+        name.endswith(suffix) for suffix in FORBIDDEN_SUFFIXES
+    ):
+        categories.add("private or runtime file")
+    if name.startswith(".env.") and name != ".env.example":
+        categories.add("environment file")
+    for category, pattern in PATTERNS.items():
+        candidate = (
+            SUPERVISOR_ENDPOINT.sub(b"supervisor-gateway", data)
+            if category == "private endpoint"
+            else data
+        )
+        if pattern.search(candidate):
+            categories.add(category)
+    if any(value in data for value in private):
+        categories.add("private catalog match")
+    return categories
+
+
+def worktree(root: Path) -> Iterator[tuple[str, bytes]]:
+    for directory, children, filenames in os.walk(root, followlinks=False):
+        children[:] = [name for name in children if name not in BUILD_DIRECTORIES]
+        for filename in filenames:
+            path = Path(directory, filename)
+            relative = str(path.relative_to(root))
+            if path.is_symlink():
+                yield relative, os.readlink(path).encode()
+            else:
+                yield relative, path.read_bytes()
+
+
+def history() -> Iterator[tuple[str, bytes]]:
+    # --all includes every ref. rev-list deduplicates objects, so its single
+    # display path is insufficient for filename bans: one blob can have both
+    # public and forbidden names. Enumerate tree entries separately below.
+    entries = git("rev-list", "--objects", "--all").splitlines()
+    blobs: dict[bytes, bytes] = {}
+    trees: set[bytes] = set()
+    commits: list[tuple[str, bytes]] = []
+    process = subprocess.Popen(
+        ["git", "cat-file", "--batch"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    try:
+        for entry in entries:
+            object_id = entry.split(b" ", 1)[0]
+            process.stdin.write(object_id + b"\n")
+            process.stdin.flush()
+            header = process.stdout.readline().split()
+            if len(header) != 3:
+                raise RuntimeError("Cannot inspect a reachable Git object")
+            size = int(header[2])
+            data = process.stdout.read(size)
+            separator = process.stdout.read(1)
+            if len(data) != size or separator != b"\n":
+                raise RuntimeError("Incomplete Git object read")
+            if header[1] == b"blob":
+                blobs[object_id] = data
+            elif header[1] == b"tree":
+                trees.add(object_id)
+            elif header[1] in {b"commit", b"tag"}:
+                # Credentials/private strings can also leak in commit messages,
+                # annotated tags, author fields, or committer metadata.
+                commits.append((f"({header[1].decode()} {object_id.decode()})", data))
+    finally:
+        process.stdin.close()
+        process.stdout.close()
+        if process.wait() != 0:
+            raise RuntimeError("Git history inspection failed")
+    yield from commits
+    seen_paths: set[tuple[bytes, bytes]] = set()
+    named_blobs: set[bytes] = set()
+    for tree in sorted(trees):
+        for entry in git("ls-tree", "-rz", "--full-tree", tree.decode()).split(b"\0"):
+            if not entry:
+                continue
+            metadata, path = entry.split(b"\t", 1)
+            _, kind, object_id = metadata.split()
+            if kind != b"blob" or (object_id, path) in seen_paths:
+                continue
+            seen_paths.add((object_id, path))
+            named_blobs.add(object_id)
+            data = blobs.get(object_id)
+            if data is None:
+                raise RuntimeError("Historical tree references an unavailable blob")
+            yield path.decode(errors="replace"), data
+    # A ref can point directly to a blob. It has no filename but its contents
+    # still belong to the reachable object graph and must be inspected.
+    for object_id in sorted(blobs.keys() - named_blobs):
+        yield f"(blob {object_id.decode()})", blobs[object_id]
+
+
+def main() -> int:
+    root = Path(git("rev-parse", "--show-toplevel").decode().strip())
+    os.chdir(root)
+    private = private_strings()
+    findings: set[tuple[str, str, str]] = set()
+    for scope, sources in (("worktree", worktree(root)), ("history", history())):
+        for path, data in sources:
+            for category in inspect(path, data, private):
+                findings.add((scope, path, category))
+    for scope, path, category in sorted(findings):
+        print(f"{scope}: {path}: {category}", file=sys.stderr)
+    if findings:
+        print(
+            "Public data check failed. Values are intentionally omitted.",
+            file=sys.stderr,
+        )
+        return 1
+    print("Public data check passed: current tree and all reachable Git history.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, subprocess.CalledProcessError, RuntimeError):
+        raise SystemExit(
+            "Public data check could not cover the full tree and history"
+        ) from None
