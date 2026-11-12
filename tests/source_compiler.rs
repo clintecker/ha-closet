@@ -490,12 +490,18 @@ async fn numeric_pair_roundtrips_through_source_json_and_the_real_cli() {
     );
     let source = CompiledCatalog::load(&path).unwrap();
     let projected = source.materialize(&BTreeMap::new()).unwrap();
-    assert!(
-        projected
-            .items()
-            .iter()
-            .all(|item| item.size.as_deref() == Some("7/8"))
-    );
+    for id in ["example-purchase-a", "example-purchase-b"] {
+        assert_eq!(
+            projected
+                .items()
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap()
+                .size
+                .as_deref(),
+            Some("7/8")
+        );
+    }
     let wire = serde_json::to_vec(projected.items()).unwrap();
     assert_eq!(
         closet::models::parse_catalog(&wire).unwrap().items(),
