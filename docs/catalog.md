@@ -79,6 +79,11 @@ labels also support exact thirds, such as `"41 1/3"` and `"41 2/3"`; these
 remain fractions, and profile bounds compare them without rounding. A missing
 size fails validation; do not invent a size to satisfy the check.
 
+Recognized category roots infer their sizing kind automatically, now including
+`jewelry` and `watches`; for any other root, such as a scarf line, declare
+`sizing_kind` explicitly in `categories.toml`, for example
+`sizing_kind = "accessory"`.
+
 Use a numeric pair for a reported footwear label such as `7/8`:
 
 ```toml
