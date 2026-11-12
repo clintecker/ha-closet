@@ -10,7 +10,7 @@ Keep these files together in private storage:
 | `fittings.toml` | Fitting labels, seasons and years |
 | `wardrobe-images/` | Local photos, named `<sha256>.png` |
 
-The [fictional example](../config/wardrobe.example/wardrobe.toml) has two
+The [fictional example](../config/wardrobe.example/wardrobe.toml) opens with two
 purchases of the same tee. Their IDs and sizes stay separate. A shared variant
 does not merge purchases or add their quantities together.
 
